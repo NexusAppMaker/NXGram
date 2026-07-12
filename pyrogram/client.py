@@ -20,6 +20,7 @@ import asyncio
 import functools
 import inspect
 import logging
+import math
 import os
 import platform
 import re
@@ -350,6 +351,14 @@ class Client(Methods):
 
         self.media_sessions = {}
         self.media_sessions_lock = asyncio.Lock()
+
+        # Separate, additive pool of media sessions (multiple real TCP
+        # connections per DC) used only by the concurrent chunk-download
+        # path in get_file(). Kept independent from media_sessions above
+        # so existing single-session consumers (inline_session, terminate)
+        # are completely untouched.
+        self.download_media_sessions = {}
+        self.download_media_sessions_lock = asyncio.Lock()
 
         self.save_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
         self.get_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
@@ -1099,6 +1108,57 @@ class Client(Methods):
                 shutil.move(temp_file_path, file_path)
                 return file_path
 
+    async def _get_download_session_pool(self, dc_id: int, pool_size: int) -> list:
+        """Lazily grow a per-DC pool of real Session objects (i.e. real TCP
+        connections) for concurrent chunk downloads. Never shrinks, so it's
+        safe to call from multiple concurrent downloads to the same DC --
+        they simply share and reuse whatever pool already exists.
+        """
+        async with self.download_media_sessions_lock:
+            pool = self.download_media_sessions.get(dc_id)
+
+            if pool is None:
+                pool = []
+                self.download_media_sessions[dc_id] = pool
+
+            while len(pool) < pool_size:
+                session = Session(
+                    self, dc_id,
+                    await Auth(self, dc_id, await self.storage.test_mode()).create()
+                    if dc_id != await self.storage.dc_id()
+                    else await self.storage.auth_key(),
+                    await self.storage.test_mode(),
+                    is_media=True
+                )
+                await session.start()
+
+                if dc_id != await self.storage.dc_id():
+                    for _ in range(3):
+                        exported_auth = await self.invoke(
+                            raw.functions.auth.ExportAuthorization(
+                                dc_id=dc_id
+                            )
+                        )
+
+                        try:
+                            await session.invoke(
+                                raw.functions.auth.ImportAuthorization(
+                                    id=exported_auth.id,
+                                    bytes=exported_auth.bytes
+                                )
+                            )
+                        except AuthBytesInvalid:
+                            continue
+                        else:
+                            break
+                    else:
+                        await session.stop()
+                        raise AuthBytesInvalid
+
+                pool.append(session)
+
+            return pool
+
     async def get_file(
         self,
         file_id: FileId,
@@ -1150,8 +1210,26 @@ class Client(Methods):
 
             current = 0
             total = abs(limit) or (1 << 31) - 1
-            chunk_size = 1024 * 1024
-            offset_bytes = abs(offset) * chunk_size
+            chunk_size = 512 * 1024  # MTProto max part size, matches upload side
+            start_chunk_index = abs(offset)
+            offset_bytes = start_chunk_index * chunk_size
+
+            # How many workers/connections make sense for this download.
+            # Small or unknown-size fetches stay on the single primary
+            # session (no benefit from a pool for a couple of chunks, and
+            # no reliable EOF bound to schedule ahead of); large known-size
+            # files scale up to 16 workers across up to 4 real DC
+            # connections, mirroring the upload-side pipeline.
+            hard_last_index = None
+            if file_size > 10 * 1024 * 1024:
+                total_full_chunks = math.ceil(file_size / chunk_size)
+                hard_last_index = min(total_full_chunks - 1, start_chunk_index + total - 1)
+                remaining_chunks = max(0, hard_last_index - start_chunk_index + 1)
+                worker_count = min(16, max(8, remaining_chunks)) if remaining_chunks > 0 else 1
+                pool_size = min(4, max(1, worker_count // 4))
+            else:
+                worker_count = 1
+                pool_size = 1
 
             dc_id = file_id.dc_id
 
@@ -1200,39 +1278,127 @@ class Client(Methods):
                 )
 
                 if isinstance(r, raw.types.upload.File):
-                    while True:
-                        chunk = r.bytes
+                    async def report_progress(off_bytes):
+                        if not progress:
+                            return
 
-                        yield chunk
-
-                        current += 1
-                        offset_bytes += chunk_size
-
-                        if progress:
-                            func = functools.partial(
-                                progress,
-                                min(offset_bytes, file_size)
-                                if file_size != 0
-                                else offset_bytes,
-                                file_size,
-                                *progress_args
-                            )
-
-                            if inspect.iscoroutinefunction(progress):
-                                await func()
-                            else:
-                                await self.loop.run_in_executor(self.executor, func)
-
-                        if len(chunk) < chunk_size or current >= total:
-                            break
-
-                        r = await session.invoke(
-                            raw.functions.upload.GetFile(
-                                location=location,
-                                offset=offset_bytes,
-                                limit=chunk_size
-                            )
+                        func = functools.partial(
+                            progress,
+                            min(off_bytes, file_size) if file_size != 0 else off_bytes,
+                            file_size,
+                            *progress_args
                         )
+
+                        if inspect.iscoroutinefunction(progress):
+                            await func()
+                        else:
+                            await self.loop.run_in_executor(self.executor, func)
+
+                    if worker_count == 1:
+                        # Unchanged sequential path: single connection, one
+                        # request in flight at a time. Used for small or
+                        # unknown-size files where a pool has no upside.
+                        while True:
+                            chunk = r.bytes
+
+                            yield chunk
+
+                            current += 1
+                            offset_bytes += chunk_size
+                            await report_progress(offset_bytes)
+
+                            if len(chunk) < chunk_size or current >= total:
+                                break
+
+                            r = await session.invoke(
+                                raw.functions.upload.GetFile(
+                                    location=location,
+                                    offset=offset_bytes,
+                                    limit=chunk_size
+                                )
+                            )
+                    else:
+                        # Concurrent, order-preserving pipeline: multiple
+                        # GetFile requests are kept in flight across a pool
+                        # of real DC connections, while chunks are still
+                        # yielded to the caller strictly in offset order so
+                        # the output file is written correctly. Scheduling
+                        # never goes past hard_last_index, so we never
+                        # speculatively request bytes beyond the file's
+                        # known end.
+                        pool = await self._get_download_session_pool(dc_id, pool_size)
+                        fetch_semaphore = asyncio.Semaphore(worker_count)
+
+                        async def fetch_chunk(sess, idx):
+                            off = (start_chunk_index + idx) * chunk_size
+                            attempts = 0
+                            async with fetch_semaphore:
+                                while True:
+                                    try:
+                                        return await sess.invoke(
+                                            raw.functions.upload.GetFile(
+                                                location=location,
+                                                offset=off,
+                                                limit=chunk_size
+                                            )
+                                        )
+                                    except (FloodWait, FloodPremiumWait) as e:
+                                        log.warning(
+                                            f"[{self.name}] FloodWait: sleeping {e.value}s "
+                                            f"for download chunk {idx}"
+                                        )
+                                        await asyncio.sleep(e.value)
+                                    except Exception:
+                                        attempts += 1
+                                        if attempts >= 3:
+                                            raise
+                                        await asyncio.sleep(attempts)
+
+                        pending = {}
+                        next_fetch_idx = 1  # index 0 already fetched as `r`
+                        next_yield_idx = 0
+
+                        def schedule_upto(target_count):
+                            nonlocal next_fetch_idx
+                            while (
+                                len(pending) < target_count
+                                and (hard_last_index is None or next_fetch_idx <= hard_last_index)
+                            ):
+                                sess = pool[next_fetch_idx % len(pool)]
+                                pending[next_fetch_idx] = asyncio.ensure_future(
+                                    fetch_chunk(sess, next_fetch_idx)
+                                )
+                                next_fetch_idx += 1
+
+                        try:
+                            schedule_upto(worker_count)
+
+                            while True:
+                                if next_yield_idx == 0:
+                                    result = r
+                                else:
+                                    task = pending.pop(next_yield_idx)
+                                    result = await task
+
+                                chunk = result.bytes
+
+                                yield chunk
+
+                                current += 1
+                                next_yield_idx += 1
+                                offset_bytes = (start_chunk_index + next_yield_idx) * chunk_size
+                                await report_progress(offset_bytes)
+
+                                if len(chunk) < chunk_size or current >= total:
+                                    break
+
+                                schedule_upto(worker_count)
+                        finally:
+                            leftover = list(pending.values())
+                            for t in leftover:
+                                t.cancel()
+                            if leftover:
+                                await asyncio.gather(*leftover, return_exceptions=True)
 
                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
                     cdn_session = Session(

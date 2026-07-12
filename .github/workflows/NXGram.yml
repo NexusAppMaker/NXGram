@@ -1,0 +1,56 @@
+name: Auto Extract Zip to Repo
+
+on:
+  push:
+    paths:
+      - '*.zip' 
+
+jobs:
+  extract_and_push:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Git Configuration
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+    - name: Extract Zip File
+      run: |
+        ZIP_FILE=$(ls *.zip | head -n 1)
+        
+        if [ -z "$ZIP_FILE" ]; then
+          echo "Koi zip file nahi mili!"
+          exit 1
+        fi
+        
+        echo "Extracting $ZIP_FILE..."
+        
+        mkdir temp_extract
+        unzip -q "$ZIP_FILE" -d temp_extract/
+        
+        rm "$ZIP_FILE"
+        
+        if [ $(ls temp_extract | wc -l) -eq 1 ] && [ -d temp_extract/* ]; then
+          mv temp_extract/*/* ./ 2>/dev/null || true
+          rm -rf temp_extract
+        else
+          mv temp_extract/* ./ 2>/dev/null || true
+          rm -rf temp_extract
+        fi
+
+    - name: Commit and Push Extracted Files
+      run: |
+        git add .
+        
+        if git diff --staged --quiet; then
+          echo "Koi nayi files nahi hain commit karne ke liye."
+        else
+          git commit -m "NXGram-Telegram MTProto API"
+          git push origin HEAD:${{ github.ref }}
+        fi

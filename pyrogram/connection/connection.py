@@ -20,7 +20,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from .transport import *
+from .transport import TCP, TCPAbridged, TCPAbridgedO, TCPFull, TCPIntermediate, TCPIntermediateO
 from ..session.internals import DataCenter
 
 log = logging.getLogger(__name__)
